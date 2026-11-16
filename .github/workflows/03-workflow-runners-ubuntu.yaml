@@ -1,0 +1,16 @@
+name: 03 – Workflow Runners – Ubuntu
+
+on:
+  workflow_dispatch:
+
+jobs:
+  ubuntu-echo:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Show OS
+        shell: bash
+        run: |
+          echo "This job is running on an Ubuntu runner."
+          echo "Runner OS: $RUNNER_OS"
+          uname -a
