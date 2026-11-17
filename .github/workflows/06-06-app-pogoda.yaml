@@ -1,0 +1,125 @@
+name: "06-06 Pogoda API CI"
+
+on:
+  push:
+    branches:
+      - feature/06-pogoda-api
+      - main
+
+  pull_request:
+    branches:
+      - feature/06-pogoda-api
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build, Test and Push Weather API
+    runs-on: ubuntu-latest
+
+    env:
+      LOCAL_IMAGE_NAME: python_pogoda:test
+      WORKDIR: ./CWICZENIA/06-context/pogoda_python_flusk
+      HUB_IMAGE_BASE: piotrskoska/python_pogoda
+
+    steps:
+      # 1. Pobranie repozytorium
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Budowanie obrazu Docker
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t "$LOCAL_IMAGE_NAME" \
+            "$WORKDIR"
+
+      # 3. Uruchomienie kontenera
+      - name: Run Docker container
+        env:
+          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
+        run: |
+          docker run -d \
+            --name pogoda_api \
+            -p 8000:8000 \
+            -e OPENWEATHER_API_KEY \
+            "$LOCAL_IMAGE_NAME"
+
+      # 4. Oczekiwanie na uruchomienie API
+      - name: Wait for API
+        run: |
+          echo "Czekam na start API..."
+          sleep 10
+
+      # 5. Test endpointu /weather
+      - name: Test weather endpoint
+        env:
+          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
+        run: |
+          set -e
+
+          echo "Testowanie endpointu /weather..."
+
+          curl --fail --silent --show-error \
+            --get "http://localhost:8000/weather" \
+            --data-urlencode "city=Warsaw" \
+            --data-urlencode "api_key=$OPENWEATHER_API_KEY"
+
+          echo
+          echo "OK - endpoint /weather zwrócił odpowiedź 2xx."
+
+      # 6. Logi kontenera przy błędzie
+      - name: Docker logs on failure
+        if: failure()
+        run: |
+          echo "Logi kontenera:"
+          docker logs pogoda_api || true
+
+      # 7. Sprzątanie kontenera
+      - name: Cleanup Docker container
+        if: always()
+        run: |
+          docker stop pogoda_api || true
+          docker rm pogoda_api || true
+
+      # 8. Logowanie do Docker Hub
+      - name: Docker Hub login
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # 9. Tagowanie obrazu
+      - name: Tag Docker image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+
+          echo "Tagowanie obrazu:"
+          echo "$HUB_IMAGE_BASE:andrzej"
+          echo "$HUB_IMAGE_BASE:andrzej-$SHORT_SHA"
+
+          docker tag \
+            "$LOCAL_IMAGE_NAME" \
+            "$HUB_IMAGE_BASE:andrzej"
+
+          docker tag \
+            "$LOCAL_IMAGE_NAME" \
+            "$HUB_IMAGE_BASE:andrzej-$SHORT_SHA"
+
+      # 10. Publikacja do Docker Hub
+      - name: Push Docker image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+
+          echo "Publikacja obrazów Docker..."
+
+          docker push "$HUB_IMAGE_BASE:andrzej"
+          docker push "$HUB_IMAGE_BASE:andrzej-$SHORT_SHA"
+
+          echo "Obrazy zostały opublikowane."
