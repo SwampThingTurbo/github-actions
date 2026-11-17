@@ -1,5 +1,5 @@
 
-name: Pobieranie informacji o pogodzie
+name: 06 - 3 - Pobieranie informacji o pogodzie
 
 on:
   workflow_dispatch:
