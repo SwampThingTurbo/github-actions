@@ -1,0 +1,153 @@
+
+name: 05 - Docker Compose Tests
+
+on:
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: cw04-webapp
+  TAG: latest
+  HOST_PORT: 8080
+  APP_DIR: 04-praca-z-zewnetrzymi-akcjami/docker-app-02
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Pobranie kodu
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. Konfiguracja Docker Buildx
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 3. Metadane obrazu
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ env.TAG }}
+
+      # 4. Budowanie obrazu lokalnie
+      - name: Build image (local)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ github.workspace }}/${{ env.APP_DIR }}
+          push: false
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:${{ env.TAG }}
+
+      # 5. Start aplikacji
+      - name: Compose up
+        uses: isbang/compose-action@v2
+        with:
+          compose-file: ${{ github.workspace }}/${{ env.APP_DIR }}/docker-compose.yml
+          down-flags: --volumes --remove-orphans
+
+      # 6. Sprawdzenie dostępności HTTP
+      - name: URL Health Check
+        uses: jtalk/url-health-check-action@v3
+        with:
+          url: http://localhost:${{ env.HOST_PORT }}/
+          max-attempts: 30
+          retry-delay: 1s
+          follow-redirect: false
+
+      # 7. Pobranie strony
+      - name: GET /
+        id: page
+        shell: bash
+        run: |
+          curl --fail --silent --show-error \
+            "http://localhost:${HOST_PORT}/" \
+            -o page.html
+
+      # 8. Sprawdzenie zawartości strony
+      - name: Assert page contains expected text
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('page.html', 'utf8');
+            const expected = 'cw04 github actions';
+
+            if (!body.includes(expected)) {
+              core.setFailed(
+                `Strona nie zawiera oczekiwanego napisu: "${expected}".`
+              );
+            } else {
+              core.info('Page content assertion passed.');
+            }
+
+      # 9. Pobranie obrazka
+      - name: GET /assets/wall.jpg
+        id: img
+        uses: fjogeleit/http-request-action@v1
+        with:
+          url: http://localhost:${{ env.HOST_PORT }}/assets/wall.jpg
+          method: GET
+          timeout: 30000
+
+      # 10. Weryfikacja odpowiedzi obrazka
+      - name: Assert image 200
+        uses: actions/github-script@v7
+        env:
+          IMAGE_STATUS: ${{ steps.img.outputs.status }}
+          IMAGE_HEADERS: ${{ steps.img.outputs.headers }}
+        with:
+          script: |
+            const status = Number(process.env.IMAGE_STATUS);
+
+            if (status !== 200) {
+              core.setFailed(
+                `Image request failed. HTTP status: ${status}`
+              );
+            }
+
+            const headers = (
+              process.env.IMAGE_HEADERS || ''
+            ).toLowerCase();
+
+            if (
+              !headers.includes('image') &&
+              !headers.includes('jpeg') &&
+              !headers.includes('jpg')
+            ) {
+              core.warning(
+                'Response headers do not indicate an image.'
+              );
+            }
+
+      # 11. Logi kontenera
+      - name: Docker logs (always)
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { execSync } = require('child_process');
+
+            try {
+              const logs = execSync(
+                'docker logs webapp',
+                { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }
+              );
+
+              core.info(logs);
+            } catch (error) {
+              core.warning(
+                `Could not read Docker logs: ${error.message}`
+              );
+            }
+
+      # 12. Sprzątanie
+      - name: Compose down (always)
+        if: always()
+        shell: bash
+        run: |
+          docker compose \
+            -f "${GITHUB_WORKSPACE}/${APP_DIR}/docker-compose.yml" \
+            down --volumes --remove-orphans
