@@ -1,0 +1,89 @@
+
+name: 08 - Using Variables
+
+on:
+  workflow_dispatch:
+
+# ==========================================
+# Zmienne na poziomie workflow
+# ==========================================
+env:
+  WORKFLOW_VAR: 'I am a workflow env var'
+  OVERWRITTEN: 'I will be overwritten'
+  UNDEFINED_VAR_WITH_DEFAULT: ${{ vars.UNDEFINED_VAR || 'default value' }}
+
+jobs:
+
+  # ==========================================
+  # JOB 1 - WORKFLOW, JOB AND STEP VARIABLES
+  # ==========================================
+  echo:
+    runs-on: ubuntu-latest
+
+    env:
+      JOB_VAR: 'I am a job env var'
+      OVERWRITTEN: 'I have been overwritten at the job level'
+
+    steps:
+      - name: Print Env Variables
+        env:
+          STEP_VAR: 'I am a step env var'
+          step_var2: 'I am another step var'
+
+        run: |
+          echo "Step env var: $STEP_VAR"
+          echo "Step env var 2: $step_var2"
+          echo "Job env var: $JOB_VAR"
+          echo "Workflow env var: $WORKFLOW_VAR"
+          echo "Overwritten: $OVERWRITTEN"
+
+      - name: Overwrite Job Variable
+        env:
+          OVERWRITTEN: 'I have been overwritten at the step level'
+
+        run: |
+          echo "Step env var: $OVERWRITTEN"
+
+  # ==========================================
+  # JOB 2 - REPOSITORY VARIABLES
+  # ==========================================
+  echo2:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Print Repository Variables
+        env:
+          REPOSITORY_VAR: ${{ vars.REPOSITORY_VAR }}
+
+        run: |
+          echo "Repo var: $REPOSITORY_VAR"
+
+  # ==========================================
+  # JOB 3 - ENVIRONMENT VARIABLES
+  # ==========================================
+  echo-prod:
+    runs-on: ubuntu-latest
+    environment: prod
+
+    steps:
+      - name: Print Environment Variables
+        env:
+          REPOSITORY_VAR: ${{ vars.REPOSITORY_VAR }}
+          TARGET_VAR: ${{ vars.TARGET_VAR }}
+          OVERWRITTEN_VAR: ${{ vars.OVERWRITTEN_VAR }}
+
+        run: |
+          echo "Repo var: $REPOSITORY_VAR"
+          echo "Environment var: $TARGET_VAR"
+          echo "Environment overwritten var: $OVERWRITTEN_VAR"
+
+  # ==========================================
+  # JOB 4 - DEFAULT VALUES
+  # ==========================================
+  echo-undefined:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Print Undefined Variables
+        run: |
+          echo "Undefined var: $UNDEFINED_VAR_WITH_DEFAULT"
