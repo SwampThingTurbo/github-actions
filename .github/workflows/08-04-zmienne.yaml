@@ -1,0 +1,433 @@
+name: 08-04 Pogoda API - Variables DEV PROD
+
+on:
+  # push:
+  #   branches:
+  #     - main
+  #     - feature/06-pogoda-api
+  # pull_request:
+  #   branches:
+  #     - feature/06-pogoda-api
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+# Repository variables:
+# WORKDIR=./CWICZENIA/06-context/pogoda_python_flusk
+# DOCKERHUB_USERNAME=piotrskoska
+# DOCKER_IMAGE_NAME=andrzej_python_pogoda
+# WEATHER_CITY=Warsaw
+# Environment variables (Settings -> Environments):
+# dev:  DOCKERHUB_TAG=andrzej-dev,  DOCKER_PORT_EXTERNAL=18501,
+#       DEPLOY_CONTAINER_NAME=andrzej_pogoda_dev
+# prod: DOCKERHUB_TAG=andrzej-prod, DOCKER_PORT_EXTERNAL=18502,
+#       DEPLOY_CONTAINER_NAME=andrzej_pogoda_prod
+# Secrets: DOCKERHUB_TOKEN, OPENWEATHER_API_KEY
+# The prod environment should have deployment protection rules.
+
+env:
+  WORKDIR: ${{ vars.WORKDIR }}
+  DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+  DOCKER_IMAGE_NAME: ${{ vars.DOCKER_IMAGE_NAME }}
+  HUB_IMAGE_BASE: ${{ vars.DOCKERHUB_USERNAME }}/${{ vars.DOCKER_IMAGE_NAME }}
+  TEST_IMAGE: python_pogoda:andrzej-test
+  WEATHER_CITY: ${{ vars.WEATHER_CITY }}
+  CONFIG_SCOPE: workflow
+
+jobs:
+  build:
+    name: Build test image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate build configuration
+        run: |
+          set -euo pipefail
+          for variable in WORKDIR DOCKERHUB_USERNAME DOCKER_IMAGE_NAME WEATHER_CITY; do
+            if [[ -z "${!variable}" ]]; then
+              echo "::error::Missing required repository variable: $variable"
+              exit 1
+            fi
+          done
+          echo "CONFIG_SCOPE=$CONFIG_SCOPE"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build local test image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.WORKDIR }}
+          tags: ${{ env.TEST_IMAGE }}
+          load: true
+          push: false
+
+      - name: Save image to tar
+        run: docker save "$TEST_IMAGE" -o image.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pogoda-variables-image
+          path: image.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  test:
+    name: Test weather endpoint
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: pogoda-variables-image
+
+      - name: Load Docker image
+        run: docker load -i image.tar
+
+      - name: Check API key
+        env:
+          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
+        run: |
+          if [[ -z "$OPENWEATHER_API_KEY" ]]; then
+            echo "::error::Missing OPENWEATHER_API_KEY secret"
+            exit 1
+          fi
+
+      - name: Run test container
+        env:
+          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
+        run: |
+          docker run -d \
+            --name andrzej_pogoda_api_test \
+            -p 127.0.0.1:8000:8000 \
+            -e OPENWEATHER_API_KEY \
+            "$TEST_IMAGE"
+
+      - name: Wait for test API
+        run: |
+          curl --fail --silent --show-error \
+            --retry 15 --retry-all-errors --retry-delay 2 \
+            --retry-max-time 60 --max-time 5 \
+            --output /dev/null \
+            http://127.0.0.1:8000/openapi.json
+
+      - name: Test /weather
+        run: |
+          echo "Testing /weather for city: $WEATHER_CITY"
+          curl --fail --silent --show-error --max-time 30 \
+            --get --data-urlencode "city=$WEATHER_CITY" \
+            http://127.0.0.1:8000/weather
+          echo
+
+      - name: Show test container logs on failure
+        if: failure()
+        run: docker logs andrzej_pogoda_api_test || true
+
+      - name: Remove test container
+        if: always()
+        run: docker rm --force andrzej_pogoda_api_test || true
+
+  build-and-push-dev:
+    name: Publish DEV image
+    runs-on: ubuntu-latest
+    needs: test
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/feature/06-pogoda-api' &&
+      github.event.repository.fork == false
+    environment: dev
+    outputs:
+      image_digest: ${{ steps.publish.outputs.digest }}
+    steps:
+      - name: Validate DEV publication configuration
+        env:
+          PUBLISH_TAG: ${{ vars.DOCKERHUB_TAG }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ -n "$HUB_IMAGE_BASE" && -n "$PUBLISH_TAG" && -n "$DOCKERHUB_TOKEN" ]] || {
+            echo "::error::Missing DEV image configuration or Docker Hub token"; exit 1;
+          }
+          [[ "$PUBLISH_TAG" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]] || {
+            echo "::error::Invalid Docker tag"; exit 1;
+          }
+          [[ "$PUBLISH_TAG" == andrzej-* ]] || {
+            echo "::error::DEV tag must start with andrzej-"; exit 1;
+          }
+          echo "Publishing DEV: $HUB_IMAGE_BASE:$PUBLISH_TAG"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push DEV image
+        id: publish
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.WORKDIR }}
+          push: true
+          tags: |
+            ${{ env.HUB_IMAGE_BASE }}:${{ vars.DOCKERHUB_TAG }}
+            ${{ env.HUB_IMAGE_BASE }}:andrzej-dev-${{ github.sha }}
+
+  build-and-push-prod:
+    name: Publish PROD image
+    runs-on: ubuntu-latest
+    needs: test
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/main' &&
+      github.event.repository.fork == false
+    environment: prod
+    outputs:
+      image_digest: ${{ steps.publish.outputs.digest }}
+    steps:
+      - name: Validate PROD publication configuration
+        env:
+          PUBLISH_TAG: ${{ vars.DOCKERHUB_TAG }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ -n "$HUB_IMAGE_BASE" && -n "$PUBLISH_TAG" && -n "$DOCKERHUB_TOKEN" ]] || {
+            echo "::error::Missing PROD image configuration or Docker Hub token"; exit 1;
+          }
+          [[ "$PUBLISH_TAG" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]] || {
+            echo "::error::Invalid Docker tag"; exit 1;
+          }
+          [[ "$PUBLISH_TAG" == andrzej-* ]] || {
+            echo "::error::PROD tag must start with andrzej-"; exit 1;
+          }
+          echo "Publishing PROD: $HUB_IMAGE_BASE:$PUBLISH_TAG"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push PROD image
+        id: publish
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.WORKDIR }}
+          push: true
+          tags: |
+            ${{ env.HUB_IMAGE_BASE }}:${{ vars.DOCKERHUB_TAG }}
+            ${{ env.HUB_IMAGE_BASE }}:andrzej-prod-${{ github.sha }}
+
+  deploy-dev:
+    name: Deploy DEV
+    runs-on: [self-hosted, linux, andrzej]
+    needs: build-and-push-dev
+    environment: dev
+    timeout-minutes: 5
+    concurrency:
+      group: andrzej-pogoda-api-dev-deploy
+      cancel-in-progress: false
+    env:
+      IMAGE_DIGEST: ${{ needs.build-and-push-dev.outputs.image_digest }}
+      DOCKERHUB_TAG: ${{ vars.DOCKERHUB_TAG }}
+      DOCKER_PORT_EXTERNAL: ${{ vars.DOCKER_PORT_EXTERNAL }}
+      DEPLOY_CONTAINER_NAME: ${{ vars.DEPLOY_CONTAINER_NAME }}
+      CONFIG_SCOPE: job
+    steps:
+      - name: Validate DEV deployment configuration
+        env:
+          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          for variable in HUB_IMAGE_BASE IMAGE_DIGEST DOCKERHUB_TAG DOCKER_PORT_EXTERNAL DEPLOY_CONTAINER_NAME WEATHER_CITY OPENWEATHER_API_KEY DOCKERHUB_TOKEN; do
+            if [[ -z "${!variable}" ]]; then
+              echo "::error::Missing DEV configuration: $variable"
+              exit 1
+            fi
+          done
+          [[ "$DEPLOY_CONTAINER_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]] || { echo "::error::Invalid container name"; exit 1; }
+          [[ "$DOCKER_PORT_EXTERNAL" =~ ^[0-9]{1,5}$ ]] || { echo "::error::Invalid port"; exit 1; }
+          (( 10#$DOCKER_PORT_EXTERNAL >= 1 && 10#$DOCKER_PORT_EXTERNAL <= 65535 )) || { echo "::error::Port out of range"; exit 1; }
+          [[ "$DOCKERHUB_TAG" == andrzej-* ]] || { echo "::error::Expected personal tag prefix"; exit 1; }
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]] || { echo "::error::Invalid image digest"; exit 1; }
+          echo "DEV image: $HUB_IMAGE_BASE"
+          echo "DEV tag: $DOCKERHUB_TAG"
+          echo "DEV port: $DOCKER_PORT_EXTERNAL"
+          echo "DEV container: $DEPLOY_CONTAINER_NAME"
+          echo "DEV city: $WEATHER_CITY"
+
+      - name: Print step variable scope
+        env:
+          CONFIG_SCOPE: step
+        run: echo "CONFIG_SCOPE=$CONFIG_SCOPE"
+
+      - name: Print job variable scope
+        run: echo "CONFIG_SCOPE=$CONFIG_SCOPE"
+
+      - name: Prepare API URL
+        run: echo "API_BASE_URL=http://127.0.0.1:${DOCKER_PORT_EXTERNAL}" >> "$GITHUB_ENV"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Pull exact DEV image
+        run: docker pull "${HUB_IMAGE_BASE}@${IMAGE_DIGEST}"
+
+      - name: Remove previous DEV container
+        run: |
+          existing="$(docker container ls -aq --filter "name=^/${DEPLOY_CONTAINER_NAME}$")"
+          if [[ -n "$existing" ]]; then
+            docker rm -f "$existing"
+          fi
+
+      - name: Run DEV container
+        env:
+          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
+        run: |
+          docker run -d \
+            --name "$DEPLOY_CONTAINER_NAME" \
+            --restart unless-stopped \
+            -p "${DOCKER_PORT_EXTERNAL}:8000" \
+            -e OPENWEATHER_API_KEY \
+            "${HUB_IMAGE_BASE}@${IMAGE_DIGEST}"
+
+      - name: Verify DEV API readiness
+        run: |
+          curl --fail --silent --show-error \
+            --retry 15 --retry-all-errors --retry-delay 2 \
+            --retry-max-time 60 --max-time 5 \
+            --output /dev/null \
+            "$API_BASE_URL/openapi.json"
+          test "$(docker inspect --format '{{.State.Running}}' "$DEPLOY_CONTAINER_NAME")" = true
+
+      - name: Test deployed DEV weather endpoint
+        run: |
+          curl --fail --silent --show-error --max-time 30 \
+            --get --data-urlencode "city=$WEATHER_CITY" \
+            "$API_BASE_URL/weather"
+          echo
+
+      - name: Show DEV logs on failure
+        if: failure()
+        run: docker logs "$DEPLOY_CONTAINER_NAME" || true
+
+  deploy-prod:
+    name: Deploy PROD
+    runs-on: [self-hosted, linux, andrzej]
+    needs: build-and-push-prod
+    environment: prod
+    timeout-minutes: 5
+    concurrency:
+      group: andrzej-pogoda-api-prod-deploy
+      cancel-in-progress: false
+    env:
+      IMAGE_DIGEST: ${{ needs.build-and-push-prod.outputs.image_digest }}
+      DOCKERHUB_TAG: ${{ vars.DOCKERHUB_TAG }}
+      DOCKER_PORT_EXTERNAL: ${{ vars.DOCKER_PORT_EXTERNAL }}
+      DEPLOY_CONTAINER_NAME: ${{ vars.DEPLOY_CONTAINER_NAME }}
+      CONFIG_SCOPE: job
+    steps:
+      - name: Validate PROD deployment configuration
+        env:
+          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          for variable in HUB_IMAGE_BASE IMAGE_DIGEST DOCKERHUB_TAG DOCKER_PORT_EXTERNAL DEPLOY_CONTAINER_NAME WEATHER_CITY OPENWEATHER_API_KEY DOCKERHUB_TOKEN; do
+            if [[ -z "${!variable}" ]]; then
+              echo "::error::Missing PROD configuration: $variable"
+              exit 1
+            fi
+          done
+          [[ "$DEPLOY_CONTAINER_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]] || { echo "::error::Invalid container name"; exit 1; }
+          [[ "$DOCKER_PORT_EXTERNAL" =~ ^[0-9]{1,5}$ ]] || { echo "::error::Invalid port"; exit 1; }
+          (( 10#$DOCKER_PORT_EXTERNAL >= 1 && 10#$DOCKER_PORT_EXTERNAL <= 65535 )) || { echo "::error::Port out of range"; exit 1; }
+          [[ "$DOCKERHUB_TAG" == andrzej-* ]] || { echo "::error::Expected personal tag prefix"; exit 1; }
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]] || { echo "::error::Invalid image digest"; exit 1; }
+          echo "PROD image: $HUB_IMAGE_BASE"
+          echo "PROD tag: $DOCKERHUB_TAG"
+          echo "PROD port: $DOCKER_PORT_EXTERNAL"
+          echo "PROD container: $DEPLOY_CONTAINER_NAME"
+          echo "PROD city: $WEATHER_CITY"
+
+      - name: Print step variable scope
+        env:
+          CONFIG_SCOPE: step
+        run: echo "CONFIG_SCOPE=$CONFIG_SCOPE"
+
+      - name: Print job variable scope
+        run: echo "CONFIG_SCOPE=$CONFIG_SCOPE"
+
+      - name: Prepare API URL
+        run: echo "API_BASE_URL=http://127.0.0.1:${DOCKER_PORT_EXTERNAL}" >> "$GITHUB_ENV"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Pull exact PROD image
+        run: docker pull "${HUB_IMAGE_BASE}@${IMAGE_DIGEST}"
+
+      - name: Remove previous PROD container
+        run: |
+          existing="$(docker container ls -aq --filter "name=^/${DEPLOY_CONTAINER_NAME}$")"
+          if [[ -n "$existing" ]]; then
+            docker rm -f "$existing"
+          fi
+
+      - name: Run PROD container
+        env:
+          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
+        run: |
+          docker run -d \
+            --name "$DEPLOY_CONTAINER_NAME" \
+            --restart unless-stopped \
+            -p "${DOCKER_PORT_EXTERNAL}:8000" \
+            -e OPENWEATHER_API_KEY \
+            "${HUB_IMAGE_BASE}@${IMAGE_DIGEST}"
+
+      - name: Verify PROD API readiness
+        run: |
+          curl --fail --silent --show-error \
+            --retry 15 --retry-all-errors --retry-delay 2 \
+            --retry-max-time 60 --max-time 5 \
+            --output /dev/null \
+            "$API_BASE_URL/openapi.json"
+          test "$(docker inspect --format '{{.State.Running}}' "$DEPLOY_CONTAINER_NAME")" = true
+
+      - name: Test deployed PROD weather endpoint
+        run: |
+          curl --fail --silent --show-error --max-time 30 \
+            --get --data-urlencode "city=$WEATHER_CITY" \
+            "$API_BASE_URL/weather"
+          echo
+
+      - name: Show PROD logs on failure
+        if: failure()
+        run: docker logs "$DEPLOY_CONTAINER_NAME" || true
